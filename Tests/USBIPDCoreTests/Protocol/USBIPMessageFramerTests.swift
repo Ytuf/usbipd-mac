@@ -13,9 +13,16 @@ final class USBIPMessageFramerTests: XCTestCase {
 
     /// A CMD_SUBMIT as vhci_tx sends it: usbip_header_basic, then the fixed
     /// command block, then the transfer buffer for OUT.
-    private func submit(seqnum: UInt32, devid: UInt32 = 0x0002_0001, direction: UInt32, ep: UInt32,
-                        payload: Data = Data(), transferLength: UInt32? = nil,
-                        packets: UInt32 = 0xffff_ffff, iso: Data = Data()) -> Data {
+    private func submit(
+        seqnum: UInt32,
+        devid: UInt32 = 0x0002_0001,
+        direction: UInt32,
+        ep: UInt32,
+        payload: Data = Data(),
+        transferLength: UInt32? = nil,
+        packets: UInt32 = 0xffff_ffff,
+        iso: Data = Data()
+    ) -> Data {
         var m = Data()
         m += be32(1) + be32(seqnum) + be32(devid) + be32(direction) + be32(ep)   // basic, 20 bytes
         m += be32(0)                                                            // transfer_flags
