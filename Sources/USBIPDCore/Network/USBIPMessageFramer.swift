@@ -179,21 +179,26 @@ public final class ConnectionReceivePipeline {
     private let state: USBIPConnectionState
     private let handler: (Data) -> Void
     private let onFramingError: (Error) -> Void
+    private let onFramed: ((Data) -> Void)?
 
     /// - Parameters:
     ///   - state: the connection's phase, read at framing time.
     ///   - handler: processes one whole message; may block until the transfer completes.
     ///   - onFramingError: the stream cannot be framed; the caller should close it.
+    ///   - onFramed: sees each message in wire order, before it is queued on its lane.
+    ///     Must not block.
     public init(state: USBIPConnectionState,
                 label: String,
                 qos: DispatchQoS,
                 handler: @escaping (Data) -> Void,
-                onFramingError: @escaping (Error) -> Void) {
+                onFramingError: @escaping (Error) -> Void,
+                onFramed: ((Data) -> Void)? = nil) {
         self.state = state
         self.lanes = ConnectionLanes(label: "com.usbipd.lane.\(label)", qos: qos)
         self.framingQueue = DispatchQueue(label: "com.usbipd.framing.\(label)")
         self.handler = handler
         self.onFramingError = onFramingError
+        self.onFramed = onFramed
     }
 
     /// Accepts a chunk from the socket. Safe to call from any thread.
@@ -212,6 +217,11 @@ public final class ConnectionReceivePipeline {
         }
         for message in messages {
             let key = ConnectionLanes.laneKey(for: message, phase: phase)
+            // A lane runs one message at a time, so a request can wait behind a
+            // blocking transfer on the same endpoint while its UNLINK, on the unlink
+            // lane, runs straight away. Registered here, in wire order, the request
+            // exists by the time anything can cancel it.
+            onFramed?(message)
             lanes.queue(for: key).async {
                 self.handler(message)
                 if key == ConnectionLanes.handshakeLane {
