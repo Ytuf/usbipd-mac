@@ -229,7 +229,6 @@ public class USBSubmitProcessor {
             // Execute the USB transfer
             let result = try await executeUSBTransfer(request: request, urb: urb)
 
-            
             // Create and return response
             let response = createSubmitResponse(from: request, result: result)
             

@@ -99,7 +99,13 @@ public final class IOKitUSBDevice: @unchecked Sendable {
     /// endpoint number. The two coincide on simple devices and diverge as soon as an
     /// interface has gaps or more than a couple of endpoints, so deriving one from the
     /// other was only ever going to work by accident.
-    private var pipes: [UInt8: (interfaceNumber: UInt8, pipeRef: UInt8, transferType: UInt8)] = [:]
+    private var pipes: [UInt8: Pipe] = [:]
+
+    private struct Pipe {
+        let interfaceNumber: UInt8
+        let pipeRef: UInt8
+        let transferType: UInt8
+    }
 
     /// Every endpoint the configuration declares, including those IOKit will not show.
     private var declaredEndpoints: [UInt8: USBEndpointOwner] = [:]
@@ -1146,7 +1152,7 @@ public final class IOKitUSBDevice: @unchecked Sendable {
 
             // Direction 1 is IN, which USB encodes as bit 7 of the endpoint address.
             let address = direction == 1 ? (number | 0x80) : number
-            pipes[address] = (interfaceNumber: interfaceNumber, pipeRef: pipeRef, transferType: transferType)
+            pipes[address] = Pipe(interfaceNumber: interfaceNumber, pipeRef: pipeRef, transferType: transferType)
 
             logger.debug("""
                 Interface \(interfaceNumber) pipe \(pipeRef): endpoint 0x\(String(address, radix: 16)), \

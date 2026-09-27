@@ -47,8 +47,14 @@ final class MassStorageBridgeTests: XCTestCase {
     }
 
     /// Status wrapper: signature, tag, residue, status.
-    private func assertStatus(_ data: Data?, tag: UInt32, residue: UInt32 = 0, failed: Bool = false,
-                              file: StaticString = #filePath, line: UInt = #line) {
+    private func assertStatus(
+        _ data: Data?,
+        tag: UInt32,
+        residue: UInt32 = 0,
+        failed: Bool = false,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
         guard let bytes = data.map(Array.init), bytes.count == 13 else {
             return XCTFail("expected a 13-byte CSW, got \(String(describing: data))", file: file, line: line)
         }

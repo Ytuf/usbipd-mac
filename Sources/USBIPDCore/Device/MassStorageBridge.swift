@@ -108,15 +108,41 @@ final class MassStorageBridge: @unchecked Sendable {
     private let vendor: String
     private let product: String
 
+    /// SCSI sense: key, additional sense code and qualifier.
+    private struct Sense: Equatable {
+        let key: UInt8
+        let asc: UInt8
+        let ascq: UInt8
+
+        static let none = Sense(key: 0x00, asc: 0x00, ascq: 0x00)
+        static let notReadyNoMedium = Sense(key: 0x02, asc: 0x3A, ascq: 0x00)
+        static let invalidOpcode = Sense(key: 0x05, asc: 0x20, ascq: 0x00)
+        static let lbaOutOfRange = Sense(key: 0x05, asc: 0x21, ascq: 0x00)
+        static let invalidFieldInCDB = Sense(key: 0x05, asc: 0x24, ascq: 0x00)
+        static let unrecoveredReadError = Sense(key: 0x03, asc: 0x11, ascq: 0x00)
+        static let writeError = Sense(key: 0x03, asc: 0x0C, ascq: 0x00)
+        static let writeProtected = Sense(key: 0x07, asc: 0x27, ascq: 0x00)
+    }
+
+    /// A write in progress: where the next whole block goes, and what is still owed.
+    private struct PendingWrite {
+        var lba: UInt64
+        let expected: Int
+        var received: Int
+        var pending: Data
+        let tag: UInt32
+        var failed: Bool
+    }
+
     private enum Phase {
         case command
         case dataIn(Data, sent: Int, status: Data)
-        case dataOut(lba: UInt64, expected: Int, received: Int, pending: Data, tag: UInt32, failed: Bool)
+        case dataOut(PendingWrite)
         case status(Data)
     }
 
     private var phase: Phase = .command
-    private var sense: (key: UInt8, asc: UInt8, ascq: UInt8) = (0, 0, 0)
+    private var sense = Sense.none
     private var cancelGeneration = 0
     private let condition = NSCondition()
 
@@ -135,9 +161,8 @@ final class MassStorageBridge: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
 
-        if case let .dataOut(lba, expected, received, pending, tag, failed) = phase {
-            acceptWriteData(data, lba: lba, expected: expected, received: received,
-                            pending: pending, tag: tag, failed: failed)
+        if case let .dataOut(write) = phase {
+            acceptWriteData(data, into: write)
         } else {
             execute(commandBlock: data)
         }
@@ -206,13 +231,13 @@ final class MassStorageBridge: @unchecked Sendable {
         let toHost = (cbw[12] & 0x80) != 0
         let cdb = Array(cbw[15..<(15 + Int(min(cbw[14], 16)))])
         guard let opcode = cdb.first else {
-            finish(tag: tag, length: length, toHost: toHost, failWith: (0x05, 0x20, 0x00))
+            finish(tag: tag, length: length, toHost: toHost, failWith: .invalidOpcode)
             return
         }
 
         switch opcode {
         case 0x00: // TEST UNIT READY
-            finish(tag: tag, length: length, toHost: toHost, failWith: device == nil ? (0x02, 0x3A, 0x00) : nil)
+            finish(tag: tag, length: length, toHost: toHost, failWith: device == nil ? Sense.notReadyNoMedium : nil)
         case 0x03: // REQUEST SENSE
             var fixed = [UInt8](repeating: 0, count: 18)
             fixed[0] = 0x70
@@ -220,11 +245,11 @@ final class MassStorageBridge: @unchecked Sendable {
             fixed[7] = 10
             fixed[12] = sense.asc
             fixed[13] = sense.ascq
-            sense = (0, 0, 0)
+            sense = .none
             respond(tag: tag, length: length, data: fixed.prefix(Int(cdb.count > 4 ? cdb[4] : 18)))
         case 0x12: // INQUIRY
             if cdb.count > 1 && (cdb[1] & 0x01) != 0 {
-                finish(tag: tag, length: length, toHost: toHost, failWith: (0x05, 0x24, 0x00))
+                finish(tag: tag, length: length, toHost: toHost, failWith: .invalidFieldInCDB)
                 return
             }
             var inquiry: [UInt8] = [0x00, 0x80, 0x04, 0x02, 31, 0, 0, 0]
@@ -241,7 +266,7 @@ final class MassStorageBridge: @unchecked Sendable {
             finish(tag: tag, length: length, toHost: toHost, failWith: nil)
         case 0x23: // READ FORMAT CAPACITIES
             guard let device = device else {
-                finish(tag: tag, length: length, toHost: toHost, failWith: (0x02, 0x3A, 0x00))
+                finish(tag: tag, length: length, toHost: toHost, failWith: .notReadyNoMedium)
                 return
             }
             var list: [UInt8] = [0, 0, 0, 8]
@@ -249,14 +274,14 @@ final class MassStorageBridge: @unchecked Sendable {
             respond(tag: tag, length: length, data: list.prefix(allocation(cdb, at: 7, width: 2)))
         case 0x25: // READ CAPACITY(10)
             guard let device = device else {
-                finish(tag: tag, length: length, toHost: toHost, failWith: (0x02, 0x3A, 0x00))
+                finish(tag: tag, length: length, toHost: toHost, failWith: .notReadyNoMedium)
                 return
             }
             let last = UInt32(clamping: device.blockCount &- 1)
             respond(tag: tag, length: length, data: be32(last) + be32(device.blockSize))
         case 0x9E where cdb.count > 1 && (cdb[1] & 0x1F) == 0x10: // READ CAPACITY(16)
             guard let device = device else {
-                finish(tag: tag, length: length, toHost: toHost, failWith: (0x02, 0x3A, 0x00))
+                finish(tag: tag, length: length, toHost: toHost, failWith: .notReadyNoMedium)
                 return
             }
             var capacity = be64(device.blockCount &- 1) + be32(device.blockSize)
@@ -265,58 +290,57 @@ final class MassStorageBridge: @unchecked Sendable {
         case 0x28, 0xA8, 0x88: // READ(10), READ(12), READ(16)
             let (lba, blocks) = addressing(cdb)
             guard let device = device else {
-                finish(tag: tag, length: length, toHost: toHost, failWith: (0x02, 0x3A, 0x00))
+                finish(tag: tag, length: length, toHost: toHost, failWith: .notReadyNoMedium)
                 return
             }
             do {
                 respond(tag: tag, length: length, data: try device.read(lba: lba, blocks: blocks))
             } catch BlockDeviceError.outOfRange {
-                finish(tag: tag, length: length, toHost: toHost, failWith: (0x05, 0x21, 0x00))
+                finish(tag: tag, length: length, toHost: toHost, failWith: .lbaOutOfRange)
             } catch {
-                finish(tag: tag, length: length, toHost: toHost, failWith: (0x03, 0x11, 0x00))
+                finish(tag: tag, length: length, toHost: toHost, failWith: .unrecoveredReadError)
             }
         case 0x2A, 0xAA, 0x8A: // WRITE(10), WRITE(12), WRITE(16)
             let (lba, _) = addressing(cdb)
-            let failure: (UInt8, UInt8, UInt8)? = device == nil ? (0x02, 0x3A, 0x00)
-                : (device?.isWritable == false ? (0x07, 0x27, 0x00) : nil)
-            if let failure = failure { sense = (failure.0, failure.1, failure.2) }
+            let failure: Sense? = device == nil ? .notReadyNoMedium
+                : (device?.isWritable == false ? .writeProtected : nil)
+            if let failure = failure { sense = failure }
             if length == 0 {
                 phase = .status(csw(tag: tag, residue: 0, failed: failure != nil))
             } else {
-                phase = .dataOut(lba: lba, expected: length, received: 0, pending: Data(), tag: tag, failed: failure != nil)
+                phase = .dataOut(PendingWrite(lba: lba, expected: length, received: 0, pending: Data(),
+                                              tag: tag, failed: failure != nil))
             }
         default:
-            finish(tag: tag, length: length, toHost: toHost, failWith: (0x05, 0x20, 0x00))
+            finish(tag: tag, length: length, toHost: toHost, failWith: .invalidOpcode)
         }
     }
 
-    private func acceptWriteData(_ data: Data, lba: UInt64, expected: Int, received: Int,
-                                 pending: Data, tag: UInt32, failed: Bool) {
-        var buffer = pending + data
-        var nextLBA = lba
-        var hasFailed = failed
-        let total = received + data.count
+    private func acceptWriteData(_ data: Data, into write: PendingWrite) {
+        var write = write
+        write.pending += data
+        write.received += data.count
 
         // Write whole blocks as they arrive rather than holding the whole transfer.
-        if !hasFailed, let device = device {
+        if !write.failed, let device = device {
             let blockSize = Int(device.blockSize)
-            let whole = (buffer.count / blockSize) * blockSize
+            let whole = (write.pending.count / blockSize) * blockSize
             if whole > 0 {
                 do {
-                    try device.write(lba: nextLBA, data: buffer.prefix(whole))
-                    nextLBA += UInt64(whole / blockSize)
-                    buffer = buffer.subdata(in: whole..<buffer.count)
+                    try device.write(lba: write.lba, data: write.pending.prefix(whole))
+                    write.lba += UInt64(whole / blockSize)
+                    write.pending = write.pending.subdata(in: whole..<write.pending.count)
                 } catch {
-                    hasFailed = true
-                    sense = (0x03, 0x0C, 0x00)
+                    write.failed = true
+                    sense = .writeError
                 }
             }
         }
 
-        if total >= expected {
-            phase = .status(csw(tag: tag, residue: 0, failed: hasFailed))
+        if write.received >= write.expected {
+            phase = .status(csw(tag: write.tag, residue: 0, failed: write.failed))
         } else {
-            phase = .dataOut(lba: nextLBA, expected: expected, received: total, pending: buffer, tag: tag, failed: hasFailed)
+            phase = .dataOut(write)
         }
     }
 
@@ -330,9 +354,9 @@ final class MassStorageBridge: @unchecked Sendable {
 
     /// A command with no data of its own. On failure the data phase the client expects
     /// still happens — empty for IN, drained for OUT — before a failed status.
-    private func finish(tag: UInt32, length: Int, toHost: Bool, failWith failure: (UInt8, UInt8, UInt8)?) {
+    private func finish(tag: UInt32, length: Int, toHost: Bool, failWith failure: Sense?) {
         if let failure = failure {
-            sense = (failure.0, failure.1, failure.2)
+            sense = failure
         }
         let status = csw(tag: tag, residue: UInt32(length), failed: failure != nil)
         if length == 0 {
@@ -340,7 +364,7 @@ final class MassStorageBridge: @unchecked Sendable {
         } else if toHost {
             phase = .dataIn(Data(), sent: 0, status: status)
         } else {
-            phase = .dataOut(lba: 0, expected: length, received: 0, pending: Data(), tag: tag, failed: true)
+            phase = .dataOut(PendingWrite(lba: 0, expected: length, received: 0, pending: Data(), tag: tag, failed: true))
         }
     }
 
