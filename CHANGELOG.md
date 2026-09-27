@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — composite devices are served whole, including interfaces macOS drives
+
+Every transfer used to go through interface 0. A device whose interface 0 macOS holds
+(a CDC-ACM console) could not enumerate; a multi-target CMSIS-DAP probe served only its
+first target. The daemon now opens every interface, routes each endpoint to the
+interface that owns it, and sends control requests on the default pipe.
+
+Interfaces macOS drives are captured while a client is attached and released after:
+`USBDeviceReEnumerate` with the capture option, which root may use without an
+entitlement. `bind` no longer refuses such devices. Mass storage is bridged instead —
+its driver survives capture — by answering Bulk-Only Transport and SCSI from the raw
+disk, unmounted first; this needs Full Disk Access for the daemon. Note what binding a
+drive now means: any host that can reach port 3240 gets raw block access to it.
+
+A client's connection is closed when its device leaves the Mac's bus, as `usbip-host`
+does, and a connection stays pinned to the device it imported. Device discovery had
+never tracked a device — its callbacks released each IOKit object before handling it —
+so no departure had ever been reported.
+
+Also fixed: two UNLINK races that made Linux drop the connection; aborted pipes cleared
+on the host side only, losing the next reply; stalls reported as `EPROTO` instead of
+`EPIPE`; a full IOKit enumeration on every URB; per-URB logging at info level.
+
 ### Removed — the System Extension subsystem
 
 Some 24,000 lines that no shipping path could reach, and a release artifact no
