@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — connections the client closed first were never released
+
+When a client hung up first — every `usbip list -r`, every failed import — the
+connection was dropped from the server's table but never cancelled, so its socket sat
+in `CLOSE_WAIT` for the life of the daemon. They accumulate at one per request; a
+daemon found no longer accepting on its Tailscale address held 609 of them.
+
 ### Changed — composite devices are served whole, including interfaces macOS drives
 
 Every transfer used to go through interface 0. A device whose interface 0 macOS holds
